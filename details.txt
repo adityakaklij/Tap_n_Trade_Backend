@@ -1,0 +1,188 @@
+
+
+tap tradingg project backend.
+
+Create a node js backend to manage the following.
+Will be using MongoDB as database.
+
+About the project: Tap trading game, where users can bets on the future out-come of the tokens to win.
+User will get a contineous strem of price, on the x axis it'a a time where each tile is 10 secs apart and on the Y axis it's a price,
+Within a span of 10 secs, user is able to place the trade, and based on the out-come, like user tap on the tile, we record the tile and once the round is resolve users will either win or lose  
+
+For the gride, the X axis will be the same 10sec. for Y axis should vairy.
+E.g. of the token is at price 1000$ then the spread might be +-10$ such that each tile will contain the spread of 10$. 
+But this spread will be chang realt-time based on the token, volatility.
+
+Also the winning amount also varies on the user time of bet, actual price at the bet, the differen and all the factors.
+For all maths and calculations refer to @calculations.txt for explainign all the formulas and calculations.
+
+Base line: 
+- will have taking the 10 sec duration for each session.
+- User can bet on the next session, and the current session gets pause for the resolution
+- Will be using Binance websockt for the contineous feed.
+- Will have to create the Rest endpoint like deposite, withdraw, current balance, trade, etc..
+- A websockt connection for the contineous price  
+
+
+Tables: 
+users
+─────────────────────────────────────────
+id                UUID          PK
+wallet_address    VARCHAR(66)   UNIQUE NOT NULL   -- Sui address
+balance           BIGINT        NOT NULL DEFAULT 0 -- in smallest unit (MIST)
+locked_balance    BIGINT        NOT NULL DEFAULT 0 -- amount in active bets
+nonce             BIGINT        NOT NULL DEFAULT 0 -- increments every action
+total_deposited   BIGINT        NOT NULL DEFAULT 0
+total_withdrawn   BIGINT        NOT NULL DEFAULT 0
+total_bets        INT           NOT NULL DEFAULT 0
+total_wins        INT           NOT NULL DEFAULT 0
+total_losses      INT           NOT NULL DEFAULT 0
+last_seen_at      TIMESTAMPTZ
+created_at        TIMESTAMPTZ   NOT NULL DEFAULT now()
+updated_at        TIMESTAMPTZ   NOT NULL DEFAULT now()
+
+
+deposits
+─────────────────────────────────────────
+id                UUID          PK
+user_id           UUID          FK → users.id
+wallet_address    VARCHAR(66)   NOT NULL
+amount            BIGINT        NOT NULL
+sui_tx_hash       VARCHAR(66)   UNIQUE NOT NULL  -- on-chain tx
+status            ENUM          NOT NULL  -- pending, confirmed, credited
+created_at        TIMESTAMPTZ   NOT NULL DEFAULT now()
+
+withdrawals
+─────────────────────────────────────────
+id                UUID          PK
+user_id           UUID          FK → users.id
+wallet_address    VARCHAR(66)   NOT NULL
+amount            BIGINT        NOT NULL
+checkpoint_id     UUID          FK → checkpoints.id  -- which root they used
+merkle_proof      JSONB         NOT NULL  -- proof path array
+status            ENUM          NOT NULL  -- requested, submitted, confirmed, failed
+sui_tx_hash       VARCHAR(66)             -- filled when submitted on-chain
+failure_reason    TEXT
+confirmed_at      TIMESTAMPTZ
+
+rounds
+─────────────────────────────────────────
+id                UUID          PK
+round_number      BIGINT        UNIQUE NOT NULL  -- sequential 1,2,3...
+token_pair_id     UUID          FK → token_pairs.id
+open_price_id     UUID          FK → prices.id
+close_price_id    UUID          FK → prices.id   -- null until settled
+open_time         TIMESTAMPTZ   NOT NULL
+close_time        TIMESTAMPTZ   NOT NULL
+settlement_price  NUMERIC(30,10)                 -- null until settled
+grid_size         NUMERIC(30,10) NOT NULL        -- snapshot at round open
+status            ENUM          NOT NULL  -- open, closed, settling, settled
+total_bets        INT           NOT NULL DEFAULT 0
+total_stakes      BIGINT        NOT NULL DEFAULT 0
+total_payouts     BIGINT        NOT NULL DEFAULT 0
+settled_at        TIMESTAMPTZ
+created_at        TIMESTAMPTZ   NOT NULL DEFAULT now()
+
+INDEX on (status, open_time)
+INDEX on (token_pair_id, round_number)
+
+bets
+─────────────────────────────────────────
+id                UUID          PK
+user_id           UUID          FK → users.id
+round_id          UUID          FK → rounds.id
+token_pair_id     UUID          FK → token_pairs.id
+zone_low          NUMERIC(30,10) NOT NULL   -- bottom of tapped cell
+zone_high         NUMERIC(30,10) NOT NULL   -- top of tapped cell
+stake             BIGINT        NOT NULL    -- in MIST
+payout            BIGINT                   -- null until settled
+nonce             BIGINT        NOT NULL    -- user's nonce at bet time
+user_signature    VARCHAR(200)  NOT NULL    -- user signed this bet
+server_signature  VARCHAR(200)  NOT NULL    -- you co-signed acceptance
+status            ENUM          NOT NULL    -- accepted, won, lost, refunded
+balance_before    BIGINT        NOT NULL    -- snapshot for receipt chain
+balance_after     BIGINT                   -- filled on settlement
+placed_at         TIMESTAMPTZ   NOT NULL DEFAULT now()
+settled_at        TIMESTAMPTZ
+
+INDEX on (user_id, status)
+INDEX on (round_id, status)
+INDEX on (user_id, placed_at)
+
+checkpoints
+─────────────────────────────────────────
+id                UUID          PK
+checkpoint_number INT           UNIQUE NOT NULL  -- sequential
+global_root       VARCHAR(66)   NOT NULL         -- the posted merkle root
+user_root         VARCHAR(66)   NOT NULL         -- user subtree root
+round_root        VARCHAR(66)   NOT NULL         -- round subtree root
+price_root        VARCHAR(66)   NOT NULL         -- price subtree root
+total_users       INT           NOT NULL
+total_rounds      INT           NOT NULL
+total_prices      INT           NOT NULL
+from_time         TIMESTAMPTZ   NOT NULL         -- period start
+to_time           TIMESTAMPTZ   NOT NULL         -- period end
+sui_tx_hash       VARCHAR(66)                    -- on-chain tx hash
+status            ENUM          NOT NULL  -- building, posted, confirmed
+built_at          TIMESTAMPTZ
+posted_at         TIMESTAMPTZ
+confirmed_at      TIMESTAMPTZ
+created_at        TIMESTAMPTZ   NOT NULL DEFAULT now()
+
+merkle_nodes
+─────────────────────────────────────────
+id                UUID          PK
+checkpoint_id     UUID          FK → checkpoints.id
+node_hash         VARCHAR(66)   NOT NULL
+node_type         ENUM          NOT NULL  -- leaf, internal, root
+subtree           ENUM          NOT NULL  -- user, round, price, global
+level             INT           NOT NULL  -- 0 = leaf, increases up
+position          BIGINT        NOT NULL  -- left to right position at this level
+left_child_hash   VARCHAR(66)            -- null if leaf
+right_child_hash  VARCHAR(66)            -- null if leaf
+entity_id         UUID                   -- which user/round/price this leaf represents
+created_at        TIMESTAMPTZ   NOT NULL DEFAULT now()
+
+INDEX on (checkpoint_id, subtree, level, position)
+INDEX on (checkpoint_id, entity_id)
+```
+
+This table lets you reconstruct any proof path. Given a user and a checkpoint, you query their leaf node, then walk up by finding siblings at each level until you reach the root.
+
+---
+
+**How it all connects**
+```
+User deposits on-chain
+  → deposits row created
+  → users.balance updated
+  → receipts row created
+
+User places bet
+  → bets row created
+  → users.balance decremented
+  → users.locked_balance incremented
+  → users.nonce incremented
+  → receipts row created
+
+Round settles
+  → rounds.settlement_price filled
+  → rounds.status = settled
+  → bets.status = won/lost
+  → users.balance updated
+  → users.locked_balance decremented
+  → receipts row created per user
+
+Every 2 hours
+  → Read snapshot of users, rounds, prices
+  → Build merkle tree
+  → Insert all nodes into merkle_nodes
+  → Insert checkpoints row
+  → Post root to Sui
+  → Update checkpoints.sui_tx_hash
+
+User withdraws
+  → Query merkle_nodes for their proof path
+  → Create withdrawals row
+  → User submits proof to Sui contract
+  → Update withdrawals.status on confirmation

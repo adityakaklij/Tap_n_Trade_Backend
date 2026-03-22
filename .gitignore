@@ -1,0 +1,15 @@
+.env
+
+/docs
+/node_modules
+/dist
+/build
+/coverage
+/logs
+/tmp
+/cache
+/backup
+/test
+/test-results
+/test-coverage
+/test-reports

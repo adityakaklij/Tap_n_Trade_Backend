@@ -1,0 +1,408 @@
+---
+
+**Your merkle tree contains exactly three things**
+
+```
+User Deposits
+User Bets
+User Withdrawals
+```
+
+Every leaf in the tree is one of these three record types. The root hash is a fingerprint of all of them combined at that point in time.
+
+---
+
+**What each leaf looks like**
+
+Before building the tree, you need to know what data gets hashed into each leaf.
+
+**Deposit leaf:**
+```
+{
+  type:             "DEPOSIT"
+  deposit_id:       uuid
+  wallet_address:   "0xUSER..."
+  amount:           1000000000    ← in MIST
+  sui_tx_hash:      "0xTX..."     ← on-chain proof
+  timestamp:        1700000000
+  cumulative_balance_after: 1000000000
+}
+```
+
+**Bet leaf:**
+```
+{
+  type:             "BET"
+  bet_id:           uuid
+  wallet_address:   "0xUSER..."
+  round_id:         4521
+  zone_low:         43250
+  zone_high:        43260
+  stake:            10000000      ← in MIST
+  result:           "WON"         ← null until settled
+  payout:           102100000     ← null until settled
+  multiplier:       10.21
+  timestamp:        1700000100
+  cumulative_balance_after: 1092100000
+}
+```
+
+**Withdrawal leaf:**
+```
+{
+  type:             "WITHDRAWAL"
+  withdrawal_id:    uuid
+  wallet_address:   "0xUSER..."
+  amount:           500000000
+  timestamp:        1700003600
+  cumulative_balance_after: 592100000
+}
+```
+
+The `cumulative_balance_after` field is critical — it chains every record together sequentially. Each record knows the running balance at that point. This is how the contract can verify a withdrawal amount without replaying every single transaction.
+
+---
+
+**The tree structure**
+
+You have three subtrees feeding into one global root.
+
+```
+                        GLOBAL ROOT
+                       /           \
+              ACTIVITY ROOT       [reserved for future]
+             /           \
+      USER ROOT         INTEGRITY ROOT
+     /    |    \            |
+  user1 user2 user3    sequence_hash
+  tree  tree  tree
+```
+
+Actually let's keep it simpler for v1. One flat tree, all leaves sorted and hashed together:
+
+```
+                         ROOT
+                        /    \
+                   N_L          N_R
+                  /   \        /   \
+               N_LL  N_LR   N_RL  N_RR
+               / \   / \    / \   / \
+              L1 L2 L3 L4  L5 L6 L7 L8
+
+L1 = deposit_1
+L2 = bet_1
+L3 = bet_2
+L4 = bet_3 (settled)
+L5 = deposit_2
+L6 = bet_4
+L7 = withdrawal_1
+L8 = bet_5
+```
+
+Leaves are sorted by timestamp ascending. The tree is a chronological record of everything that happened.
+
+---
+
+**Building the tree step by step**
+
+**Step 1 — Collect all records up to checkpoint time T**
+
+```
+SELECT * FROM deposits    WHERE created_at <= T  ORDER BY created_at ASC
+SELECT * FROM bets        WHERE created_at <= T  ORDER BY placed_at ASC
+SELECT * FROM withdrawals WHERE created_at <= T  ORDER BY requested_at ASC
+```
+
+Merge and sort all three by timestamp:
+
+```
+[deposit_1, bet_1, bet_2, deposit_2, bet_3, bet_4, withdrawal_1, bet_5]
+```
+
+**Step 2 — Serialize each record deterministically**
+
+This is critical. Same data must always produce same bytes. Use canonical JSON — keys sorted alphabetically, no whitespace:
+
+```
+deposit_1 serialized:
+'{"amount":1000000000,"cumulative_balance_after":1000000000,
+  "deposit_id":"uuid...","sui_tx_hash":"0xTX...",
+  "timestamp":1700000000,"type":"DEPOSIT","wallet_address":"0xUSER..."}'
+```
+
+**Step 3 — Hash each leaf**
+
+```
+L1 = blake3(serialize(deposit_1))   = 0xAAA1...
+L2 = blake3(serialize(bet_1))       = 0xAAA2...
+L3 = blake3(serialize(bet_2))       = 0xAAA3...
+L4 = blake3(serialize(deposit_2))   = 0xAAA4...
+L5 = blake3(serialize(bet_3))       = 0xAAA5...
+L6 = blake3(serialize(bet_4))       = 0xAAA6...
+L7 = blake3(serialize(withdrawal_1))= 0xAAA7...
+L8 = blake3(serialize(bet_5))       = 0xAAA8...
+```
+
+**Step 4 — Pad to power of 2**
+
+Merkle trees need 2^n leaves. If you have 8 leaves, perfect. If you have 6, pad with empty hashes:
+
+```
+If leaves count is not power of 2:
+  pad with hash("EMPTY") until it is
+
+6 leaves → pad to 8
+11 leaves → pad to 16
+```
+
+**Step 5 — Build upward, pair by pair**
+
+```
+Level 1 (leaves):
+  L1, L2, L3, L4, L5, L6, L7, L8
+
+Level 2:
+  N1 = blake3(L1 + L2)
+  N2 = blake3(L3 + L4)
+  N3 = blake3(L5 + L6)
+  N4 = blake3(L7 + L8)
+
+Level 3:
+  N5 = blake3(N1 + N2)
+  N6 = blake3(N3 + N4)
+
+Level 4 (root):
+  ROOT = blake3(N5 + N6)
+```
+
+Done. ROOT is your checkpoint hash.
+
+---
+
+**What gets posted to Sui every hour**
+
+```
+checkpoint {
+  checkpoint_number:  42
+  root_hash:          "0xROOT..."
+  total_records:      8
+  from_timestamp:     1700000000
+  to_timestamp:       1700003600
+  your_signature:     "0xSIG..."
+}
+```
+
+One transaction. One hash. Immutable from this point.
+
+---
+
+**Next checkpoint — how it grows**
+
+2 hours pass. More activity happens:
+
+```
+New records since last checkpoint:
+  bet_6, bet_7, deposit_3, withdrawal_2, bet_8
+```
+
+You do NOT build a fresh tree with only new records. You rebuild the entire tree with ALL records:
+
+```
+All records sorted by time:
+[deposit_1, bet_1, bet_2, deposit_2, bet_3, bet_4, 
+ withdrawal_1, bet_5, bet_6, bet_7, deposit_3, 
+ withdrawal_2, bet_8]
+
+→ 13 leaves → pad to 16
+→ Build tree
+→ New ROOT2
+→ Post to Sui
+```
+
+ROOT2 commits to the entire history. A user only ever needs the latest root.
+
+---
+
+**Generating a withdrawal proof**
+
+User wants to withdraw. They need to prove their current balance is X.
+
+The proof has two parts:
+
+**Part 1 — Prove their latest withdrawal leaf (or deposit leaf) is in the tree**
+
+```
+User's last record is withdrawal_1 with cumulative_balance_after = 592100000
+
+Their merkle proof path:
+  sibling of L7  =  L8
+  sibling of N4  =  N3
+  sibling of N6  =  N5
+
+Verification:
+  hash(serialize(withdrawal_1))      =  L7  ✓
+  hash(L7 + L8)                      =  N4  ✓
+  hash(N3 + N4)                      =  N6  ✓
+  hash(N5 + N6)                      =  ROOT ✓
+  ROOT matches on-chain checkpoint   ✓
+```
+
+**Part 2 — Prove this is their LATEST record**
+
+You need to prevent a user from submitting an old proof with a lower balance. Two ways:
+
+```
+Option A — Sequence number on each record
+  Every record has a global sequence_number
+  Contract tracks highest sequence_number used per wallet
+  User must submit higher sequence_number than last withdrawal
+
+Option B — Nonce per user
+  Each user has a nonce that increments with every record
+  Nonce stored in the leaf
+  Contract verifies nonce > last seen nonce for this wallet
+```
+
+Nonce per user is cleaner. Bake it into every leaf:
+
+```
+deposit_1:    wallet nonce = 1
+bet_1:        wallet nonce = 2
+bet_2:        wallet nonce = 3
+withdrawal_1: wallet nonce = 4
+bet_5:        wallet nonce = 5   ← latest
+```
+
+When user withdraws, they submit the proof of their highest-nonce record. Contract checks nonce > last recorded nonce for their wallet. This prevents replay attacks completely.
+
+---
+
+**The withdrawal flow with hash verification**
+
+```
+User requests withdrawal of 500 SUI
+
+Your backend:
+  1. Finds user's latest record in current checkpoint
+  2. Generates merkle proof path
+  3. Returns to user:
+     {
+       checkpoint_number: 42,
+       root_hash: "0xROOT...",
+       record: { ...withdrawal_leaf... },
+       proof_path: ["0xL8...", "0xN3...", "0xN5..."],
+       your_signature: "0xSIG..."
+     }
+
+User submits directly to Sui contract:
+  {
+    checkpoint_number: 42,
+    record: { type: WITHDRAWAL, amount: 500, 
+              cumulative_balance_after: 592100000, nonce: 4 },
+    proof_path: [...],
+    backend_signature: "0xSIG..."
+  }
+
+Contract does:
+  1. Fetch root_hash for checkpoint 42 from its storage
+  2. Hash the submitted record
+  3. Walk up the proof path
+  4. Verify computed root == stored root  ✓
+  5. Verify backend_signature  ✓
+  6. Verify nonce > last_used_nonce[wallet]  ✓
+  7. Verify contract has enough liquidity  ✓
+  8. Transfer amount to wallet
+  9. Record nonce as used
+```
+
+You are completely absent from step 6 onwards. The user talks directly to the contract. You cannot block it.
+
+---
+
+**What happens if root is not yet submitted**
+
+This is your key design decision — users wait for the next checkpoint.
+
+```
+User wants to withdraw NOW
+Last checkpoint was 45 minutes ago
+Next checkpoint is in 15 minutes
+
+User has two options:
+
+Option A — Wait 15 minutes
+  Next checkpoint posts
+  User gets fresh proof
+  Withdraws normally
+
+Option B — Use last checkpoint proof
+  If their balance in the last checkpoint is sufficient
+  They can withdraw against that root right now
+  Without waiting
+```
+
+This means if a user has not touched their balance since the last checkpoint, they can always withdraw immediately. Only users with very recent activity need to wait.
+
+---
+
+**The "protocol can't use user funds" guarantee**
+
+This comes from your contract design, not the merkle tree itself:
+
+```
+Sui contract holds all deposited funds in a locked pool
+
+Withdrawal rule:
+  Contract ONLY releases funds when valid merkle proof is submitted
+  Contract does NOT have an admin withdrawal function
+  Contract does NOT have a pause function
+  Even YOU cannot withdraw user funds without a valid proof
+
+Liquidity rule:
+  Protocol fee goes to a separate fee_pool
+  User deposits go to user_pool
+  These are separate objects on Sui
+  Contract enforces this split on every deposit
+```
+
+The merkle tree proves the amount. The contract enforces the custody. Together they guarantee that user funds sit in the contract, unmovable by anyone except the rightful owner with a valid proof.
+
+---
+
+**The full picture in one flow**
+
+```
+User deposits
+  → Record created in DB
+  → Included in next hourly checkpoint
+  → Root posted on Sui
+  → User receives merkle proof
+  → User can withdraw anytime using that proof
+
+User bets
+  → Record created in DB
+  → Balance updated off-chain
+  → Included in next checkpoint
+  → New proof reflects new balance
+
+User withdraws
+  → Submits proof to Sui contract directly
+  → Contract verifies math
+  → Funds released
+  → You had no say in it
+```
+
+---
+
+**One line summary of each component**
+
+```
+Leaf         →  one record (deposit, bet, withdrawal) hashed to fixed bytes
+Tree         →  all leaves combined into one root hash
+Root         →  posted hourly, immutable commitment to all history
+Proof path   →  sibling hashes that let anyone verify one leaf is in the root
+Nonce        →  prevents using old proofs with stale balances
+Contract     →  verifies proof math, holds funds, releases on valid proof
+You          →  can only sign records and post roots, cannot touch user funds
+```
+Want to now go into the Sui Move contract structure for the checkpoint registry and withdrawal verifier, or the backend service that builds and posts the tree?
