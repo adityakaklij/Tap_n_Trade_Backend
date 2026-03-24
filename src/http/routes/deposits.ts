@@ -6,6 +6,7 @@ import { decFromDb, dbDecimal } from '../../lib/money.js'
 import { resolveAmountMistString } from '../../lib/amountInput.js'
 import { WalletAddressSchema } from '../validators.js'
 import { asyncHandler } from '../asyncHandler.js'
+import { mintDepositHypercertAndLog } from '../../services/hypercert.js'
 
 export const depositsRouter = Router()
 
@@ -46,13 +47,24 @@ depositsRouter.post('/deposits', asyncHandler(async (req, res) => {
     balanceAfterMist: dbDecimal(balanceAfter)
   })
 
-  res.status(201).json({
+  const response = {
     depositId: dep._id.toString(),
     status: dep.status,
     amountMist: decFromDb(dep.amountMist).toFixed(0),
     balanceMist: decFromDb(user.balanceMist).toFixed(0),
     nonce: decFromDb(user.nonce).toFixed(0)
+  }
+
+  // Non-blocking: deposit success must not depend on Hypercert availability.
+  void mintDepositHypercertAndLog({
+    depositId: response.depositId,
+    walletAddress: body.walletAddress,
+    amountMist: response.amountMist,
+    balanceMist: response.balanceMist,
+    nonce: response.nonce
   })
+
+  res.status(201).json(response)
 }))
 
 depositsRouter.get('/deposits', asyncHandler(async (req, res) => {

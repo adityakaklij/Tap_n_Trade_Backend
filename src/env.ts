@@ -9,7 +9,10 @@ const EnvSchema = z.object({
   DB_NAME: z.string().optional(),
   DB_HOST: z.string().optional(),
   DB_PORT: z.string().optional(),
-  BINANCE_WS_BASE: z.string().min(1).default('wss://stream.binance.com:9443/ws')
+  BINANCE_WS_BASE: z.string().min(1).default('wss://stream.binance.com:9443/ws'),
+  HYPERCERT_ENABLED: z.string().optional(),
+  BSKY_IDENTIFIER: z.string().optional(),
+  BSKY_APP_PASSWORD: z.string().optional()
 })
 
 export type Env = Omit<z.infer<typeof EnvSchema>, 'MONGODB_URI'> & { MONGODB_URI: string }
